@@ -272,6 +272,7 @@ class CustomCLIP_teacher(nn.Module):
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model).cuda()
+        self.token_embedding = clip_model.token_embedding  ##
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
@@ -445,6 +446,111 @@ class PromptKD(TrainerX):
 
         return mean_text_features
 
+
+    @torch.no_grad()
+    def build_prompt_tuned_multi_template_text_features(self, classnames, device):
+        if not classnames:
+            self._warn_once(
+                "pt_mtp_no_classnames",
+                "No class names available for prompt-tuned multi-template text features."
+            )
+            return None
+
+        templates = self.get_prompt_templates()
+        if not templates:
+            self._warn_once(
+                "pt_mtp_no_templates",
+                "No valid templates were found for prompt-tuned MTP."
+            )
+            return None
+
+        cache_key = None
+        if self.cfg.TRAINER.PROMPTKD.MTP_CACHE_TEXT_FEATURES:
+            cache_key = (
+                "prompt_tuned",
+                tuple(classnames),
+                tuple(templates),
+                bool(self.cfg.TRAINER.PROMPTKD.MTP_NORMALIZE_EACH_TEMPLATE),
+                str(device),
+            )
+            cached = self._mtp_text_feature_cache.get(cache_key)
+            if cached is not None:
+                return cached.to(device=device, dtype=self.model_teacher.dtype)
+
+        prompt_learner = self.model_teacher.prompt_learner
+        text_encoder = self.model_teacher.text_encoder
+        token_embedding = self.model_teacher.token_embedding
+
+        n_ctx = prompt_learner.n_ctx
+        ctx = prompt_learner.ctx.to(device=device, dtype=self.model_teacher.dtype)
+
+        if ctx.dim() == 2:
+            ctx = ctx.unsqueeze(0).expand(len(classnames), -1, -1)
+
+        all_template_features = []
+
+        for template in templates:
+            prompts = [template.format(name.replace("_", " ")) for name in classnames]
+            tokenized = torch.cat([clip.tokenize(p) for p in prompts]).to(device)
+
+            embedding = token_embedding(tokenized).type(self.model_teacher.dtype)
+
+            prefix = embedding[:, :1, :]
+            suffix = embedding[:, 1 + n_ctx:, :]
+
+            prompt_embeddings = torch.cat(
+                [
+                    prefix,
+                    ctx,
+                    suffix,
+                ],
+                dim=1,
+            )
+
+            text_features = text_encoder(prompt_embeddings, tokenized)
+
+            if self.cfg.TRAINER.PROMPTKD.MTP_NORMALIZE_EACH_TEMPLATE:
+                text_features = text_features / text_features.norm(
+                    dim=-1,
+                    keepdim=True
+                ).clamp_min(1e-12)
+
+            all_template_features.append(text_features.unsqueeze(0))
+
+        if not all_template_features:
+            self._warn_once(
+                "pt_mtp_empty_features",
+                "No prompt-tuned template features were produced."
+            )
+            return None
+
+        mean_text_features = torch.cat(all_template_features, dim=0).mean(dim=0)
+        mean_text_features = mean_text_features / mean_text_features.norm(
+            dim=-1,
+            keepdim=True
+        ).clamp_min(1e-12)
+
+        mean_text_features = mean_text_features.to(dtype=self.model_teacher.dtype)
+
+        if cache_key is not None:
+            self._mtp_text_feature_cache[cache_key] = mean_text_features.detach().cpu()
+
+        if self.cfg.TRAINER.PROMPTKD.MTP_DEBUG:
+            print(
+                f"[PromptKD][PT-MTP] Built prompt-tuned multi-template text features with "
+                f"{len(templates)} templates for {len(classnames)} classes."
+            )
+
+        return mean_text_features
+
+
+    @torch.no_grad()
+    def build_mtp_text_features(self, classnames, device):
+        if self.cfg.TRAINER.PROMPTKD.MTP_USE_PROMPT_TUNED:
+            return self.build_prompt_tuned_multi_template_text_features(classnames, device)
+
+        return self.build_multi_template_text_features(classnames, device)
+
     def _align_text_feature_shape(self, candidate, reference):
         if candidate is None:
             return None
@@ -527,12 +633,19 @@ class PromptKD(TrainerX):
 
         if self.cfg.TRAINER.PROMPTKD.USE_MULTI_TEMPLATE_TEXT:
             classnames = self.get_current_classnames()
-            mtp_features = self.build_multi_template_text_features(classnames, tea_text_features.device)
+            mtp_features = self.build_mtp_text_features(
+                classnames,
+                tea_text_features.device,
+            )
             mtp_features = self._align_text_feature_shape(mtp_features, tea_text_features)
+
             if mtp_features is not None:
                 alpha = float(self.cfg.TRAINER.PROMPTKD.MTP_ALPHA)
                 calibrated = (1.0 - alpha) * calibrated + alpha * mtp_features
-                calibrated = calibrated / calibrated.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+                calibrated = calibrated / calibrated.norm(
+                    dim=-1,
+                    keepdim=True
+                ).clamp_min(1e-12)
 
         if self.cfg.TRAINER.PROMPTKD.TEXT_CALIBRATION_DIAGNOSE:
             self._record_text_calibration_diag(tea_text_features, calibrated)
@@ -925,7 +1038,7 @@ class PromptKD(TrainerX):
             # 只在第一个 batch 构建 text features，后面复用即可
             if original_text_features_cache is None:
                 original_text_features = tea_text_features
-                mtp_text_features = self.build_multi_template_text_features(
+                mtp_text_features = self.build_mtp_text_features(
                     classnames,
                     tea_text_features.device,
                 )
@@ -1009,6 +1122,7 @@ class PromptKD(TrainerX):
             "split": split,
             "num_samples": int(total),
             "num_classes": int(self.n_cls),
+            "mtp_use_prompt_tuned": bool(self.cfg.TRAINER.PROMPTKD.MTP_USE_PROMPT_TUNED),
             "template_set": str(self.cfg.TRAINER.PROMPTKD.MTP_TEMPLATE_SET),
             "num_templates": int(len(templates)),
             "templates": templates,
@@ -1063,7 +1177,16 @@ class PromptKD(TrainerX):
         clip_model = load_clip_to_cpu(cfg)
         clip_model_teacher = load_clip_to_cpu_teacher(cfg)
 
-        if cfg.TRAINER.PROMPTKD.USE_MULTI_TEMPLATE_TEXT or cfg.TRAINER.PROMPTKD.TEXT_CALIBRATION_DIAGNOSE:
+        mtp_use_prompt_tuned = bool(
+            getattr(cfg.TRAINER.PROMPTKD, "MTP_USE_PROMPT_TUNED", True)
+        )
+
+        need_zeroshot_text_model = (
+            (cfg.TRAINER.PROMPTKD.USE_MULTI_TEMPLATE_TEXT or cfg.TRAINER.PROMPTKD.TEXT_CALIBRATION_DIAGNOSE)
+        and not mtp_use_prompt_tuned
+        )
+
+        if need_zeroshot_text_model:
             clip_model_teacher_zeroshot = load_clip_to_cpu_teacher(cfg, zero_shot_model=True)
             self.teacher_text_model = clip_model_teacher_zeroshot.to(self.device)
             self.teacher_text_model.eval()
