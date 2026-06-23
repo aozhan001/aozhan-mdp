@@ -272,7 +272,6 @@ class CustomCLIP_teacher(nn.Module):
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model).cuda()
-        self.token_embedding = clip_model.token_embedding  ##
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
@@ -446,111 +445,6 @@ class PromptKD(TrainerX):
 
         return mean_text_features
 
-
-    @torch.no_grad()
-    def build_prompt_tuned_multi_template_text_features(self, classnames, device):
-        if not classnames:
-            self._warn_once(
-                "pt_mtp_no_classnames",
-                "No class names available for prompt-tuned multi-template text features."
-            )
-            return None
-
-        templates = self.get_prompt_templates()
-        if not templates:
-            self._warn_once(
-                "pt_mtp_no_templates",
-                "No valid templates were found for prompt-tuned MTP."
-            )
-            return None
-
-        cache_key = None
-        if self.cfg.TRAINER.PROMPTKD.MTP_CACHE_TEXT_FEATURES:
-            cache_key = (
-                "prompt_tuned",
-                tuple(classnames),
-                tuple(templates),
-                bool(self.cfg.TRAINER.PROMPTKD.MTP_NORMALIZE_EACH_TEMPLATE),
-                str(device),
-            )
-            cached = self._mtp_text_feature_cache.get(cache_key)
-            if cached is not None:
-                return cached.to(device=device, dtype=self.model_teacher.dtype)
-
-        prompt_learner = self.model_teacher.prompt_learner
-        text_encoder = self.model_teacher.text_encoder
-        token_embedding = self.model_teacher.token_embedding
-
-        n_ctx = prompt_learner.n_ctx
-        ctx = prompt_learner.ctx.to(device=device, dtype=self.model_teacher.dtype)
-
-        if ctx.dim() == 2:
-            ctx = ctx.unsqueeze(0).expand(len(classnames), -1, -1)
-
-        all_template_features = []
-
-        for template in templates:
-            prompts = [template.format(name.replace("_", " ")) for name in classnames]
-            tokenized = torch.cat([clip.tokenize(p) for p in prompts]).to(device)
-
-            embedding = token_embedding(tokenized).type(self.model_teacher.dtype)
-
-            prefix = embedding[:, :1, :]
-            suffix = embedding[:, 1 + n_ctx:, :]
-
-            prompt_embeddings = torch.cat(
-                [
-                    prefix,
-                    ctx,
-                    suffix,
-                ],
-                dim=1,
-            )
-
-            text_features = text_encoder(prompt_embeddings, tokenized)
-
-            if self.cfg.TRAINER.PROMPTKD.MTP_NORMALIZE_EACH_TEMPLATE:
-                text_features = text_features / text_features.norm(
-                    dim=-1,
-                    keepdim=True
-                ).clamp_min(1e-12)
-
-            all_template_features.append(text_features.unsqueeze(0))
-
-        if not all_template_features:
-            self._warn_once(
-                "pt_mtp_empty_features",
-                "No prompt-tuned template features were produced."
-            )
-            return None
-
-        mean_text_features = torch.cat(all_template_features, dim=0).mean(dim=0)
-        mean_text_features = mean_text_features / mean_text_features.norm(
-            dim=-1,
-            keepdim=True
-        ).clamp_min(1e-12)
-
-        mean_text_features = mean_text_features.to(dtype=self.model_teacher.dtype)
-
-        if cache_key is not None:
-            self._mtp_text_feature_cache[cache_key] = mean_text_features.detach().cpu()
-
-        if self.cfg.TRAINER.PROMPTKD.MTP_DEBUG:
-            print(
-                f"[PromptKD][PT-MTP] Built prompt-tuned multi-template text features with "
-                f"{len(templates)} templates for {len(classnames)} classes."
-            )
-
-        return mean_text_features
-
-
-    @torch.no_grad()
-    def build_mtp_text_features(self, classnames, device):
-        if self.cfg.TRAINER.PROMPTKD.MTP_USE_PROMPT_TUNED:
-            return self.build_prompt_tuned_multi_template_text_features(classnames, device)
-
-        return self.build_multi_template_text_features(classnames, device)
-
     def _align_text_feature_shape(self, candidate, reference):
         if candidate is None:
             return None
@@ -633,19 +527,12 @@ class PromptKD(TrainerX):
 
         if self.cfg.TRAINER.PROMPTKD.USE_MULTI_TEMPLATE_TEXT:
             classnames = self.get_current_classnames()
-            mtp_features = self.build_mtp_text_features(
-                classnames,
-                tea_text_features.device,
-            )
+            mtp_features = self.build_multi_template_text_features(classnames, tea_text_features.device)
             mtp_features = self._align_text_feature_shape(mtp_features, tea_text_features)
-
             if mtp_features is not None:
                 alpha = float(self.cfg.TRAINER.PROMPTKD.MTP_ALPHA)
                 calibrated = (1.0 - alpha) * calibrated + alpha * mtp_features
-                calibrated = calibrated / calibrated.norm(
-                    dim=-1,
-                    keepdim=True
-                ).clamp_min(1e-12)
+                calibrated = calibrated / calibrated.norm(dim=-1, keepdim=True).clamp_min(1e-12)
 
         if self.cfg.TRAINER.PROMPTKD.TEXT_CALIBRATION_DIAGNOSE:
             self._record_text_calibration_diag(tea_text_features, calibrated)
@@ -970,23 +857,6 @@ class PromptKD(TrainerX):
             return self.train_loader_x
         return self.test_loader
 
-    def _select_classifier_by_split(self, text_features, split):
-        if self.train_modal == "base2novel":
-            split_point = math.ceil(self.n_cls / 2)
-
-            if split == "val":
-                return text_features[:split_point, :]
-
-            if split == "test":
-                return text_features[split_point:, :]
-
-            return text_features
-
-        if self.train_modal == "cross":
-            return text_features
-
-        raise ValueError(f"Unsupported modal: {self.train_modal}")
-
     @torch.no_grad()
     def maybe_run_text_calibration_diagnose(self):
         if not self.cfg.TRAINER.PROMPTKD.TEXT_CALIBRATION_DIAGNOSE:
@@ -994,7 +864,6 @@ class PromptKD(TrainerX):
 
         split = self.cfg.TRAINER.PROMPTKD.TEXT_CALIBRATION_DIAG_SPLIT
         data_loader = self._get_eval_loader(split)
-
         if data_loader is None:
             self._warn_once(
                 "diag_no_loader",
@@ -1003,155 +872,49 @@ class PromptKD(TrainerX):
             return
 
         self.set_model_mode("eval")
-        self.model_teacher.eval()
-
-        classnames = self.get_current_classnames()
-        templates = self.get_prompt_templates()
-
-        original_correct = 0
-        mtp_raw_correct = 0
-        mtp_fused_correct = 0
-        total = 0
-
-        cosine_values = []
-        logit_shift_raw_values = []
-        logit_shift_fused_values = []
-
-        original_text_features_cache = None
-        mtp_text_features_cache = None
-        fused_text_features_cache = None
-
-        for batch in tqdm(data_loader, desc=f"Teacher text diagnosis on {split}"):
-            image, label = self.parse_batch_test(batch)
-
-            tea_image_features, tea_text_features, tea_logits = self.model_teacher(image)
-
-            tea_image_features = tea_image_features.detach()
-            tea_text_features = tea_text_features.detach()
-
-            logit_scale = self._normalize_logit_scale(
+        teacher_text = None
+        calibrated_text = None
+        image_batches = 0
+        logit_shift = []
+        for batch in data_loader:
+            image, _ = self.parse_batch_test(batch)
+            tea_image_features, tea_text_features, _ = self.model_teacher(image)
+            teacher_text = self._get_base_teacher_text_features(tea_text_features)
+            calibrated_text = self.get_calibrated_text_features(teacher_text)
+            calibrated_logits = self._normalize_logit_scale(
                 self.model_teacher.logit_scale.exp(),
                 tea_image_features.device,
                 tea_image_features.dtype,
-            )
+            ) * tea_image_features @ calibrated_text.t()
+            base_logits = self._normalize_logit_scale(
+                self.model_teacher.logit_scale.exp(),
+                tea_image_features.device,
+                tea_image_features.dtype,
+            ) * tea_image_features @ teacher_text.t()
+            shift = (calibrated_logits - base_logits).abs().mean().item()
+            logit_shift.append(shift)
+            image_batches += 1
+            if image_batches >= 1:
+                break
 
-            # 只在第一个 batch 构建 text features，后面复用即可
-            if original_text_features_cache is None:
-                original_text_features = tea_text_features
-                mtp_text_features = self.build_mtp_text_features(
-                    classnames,
-                    tea_text_features.device,
-                )
-                mtp_text_features = self._align_text_feature_shape(
-                    mtp_text_features,
-                    tea_text_features,
-                )
-
-                if mtp_text_features is None:
-                    self._warn_once(
-                        "diag_mtp_features_none",
-                        "Failed to build MTP text features, skipping teacher accuracy diagnosis."
-                    )
-                    return
-
-                alpha = float(self.cfg.TRAINER.PROMPTKD.MTP_ALPHA)
-                fused_text_features = (1.0 - alpha) * original_text_features + alpha * mtp_text_features
-                fused_text_features = fused_text_features / fused_text_features.norm(
-                    dim=-1,
-                    keepdim=True
-                ).clamp_min(1e-12)
-
-                original_text_features_cache = original_text_features.detach()
-                mtp_text_features_cache = mtp_text_features.detach()
-                fused_text_features_cache = fused_text_features.detach()
-
-                cosine = F.cosine_similarity(
-                    original_text_features_cache.float(),
-                    mtp_text_features_cache.float(),
-                    dim=1,
-                )
-                cosine_values.append(cosine.detach().cpu())
-
-            original_classifier = self._select_classifier_by_split(
-                original_text_features_cache,
-                split,
-            )
-            mtp_raw_classifier = self._select_classifier_by_split(
-                mtp_text_features_cache,
-                split,
-            )
-            mtp_fused_classifier = self._select_classifier_by_split(
-                fused_text_features_cache,
-                split,
-            )
-
-            original_logits = logit_scale * tea_image_features @ original_classifier.t()
-            mtp_raw_logits = logit_scale * tea_image_features @ mtp_raw_classifier.t()
-            mtp_fused_logits = logit_scale * tea_image_features @ mtp_fused_classifier.t()
-
-            original_pred = original_logits.argmax(dim=1)
-            mtp_raw_pred = mtp_raw_logits.argmax(dim=1)
-            mtp_fused_pred = mtp_fused_logits.argmax(dim=1)
-
-            original_correct += (original_pred == label).sum().item()
-            mtp_raw_correct += (mtp_raw_pred == label).sum().item()
-            mtp_fused_correct += (mtp_fused_pred == label).sum().item()
-            total += label.numel()
-
-            logit_shift_raw_values.append(
-                (mtp_raw_logits - original_logits).abs().mean().detach().cpu()
-            )
-            logit_shift_fused_values.append(
-                (mtp_fused_logits - original_logits).abs().mean().detach().cpu()
-            )
-
-        if total == 0:
-            self._warn_once(
-                "diag_empty_loader",
-                f"No samples found in diagnostic split '{split}'."
-            )
+        if teacher_text is None or calibrated_text is None:
             return
 
-        cosine_all = torch.cat(cosine_values) if cosine_values else torch.tensor([0.0])
-        logit_shift_raw = torch.stack(logit_shift_raw_values).mean().item() if logit_shift_raw_values else 0.0
-        logit_shift_fused = torch.stack(logit_shift_fused_values).mean().item() if logit_shift_fused_values else 0.0
+        self._record_text_calibration_diag(teacher_text, calibrated_text)
+        if self._text_calibration_diag is None:
+            return
 
-        diag = {
-            "dataset": self.cfg.DATASET.NAME,
-            "modal": self.cfg.TRAINER.MODAL,
-            "split": split,
-            "num_samples": int(total),
-            "num_classes": int(self.n_cls),
-            "mtp_use_prompt_tuned": bool(self.cfg.TRAINER.PROMPTKD.MTP_USE_PROMPT_TUNED),
-            "template_set": str(self.cfg.TRAINER.PROMPTKD.MTP_TEMPLATE_SET),
-            "num_templates": int(len(templates)),
-            "templates": templates,
-            "mtp_alpha": float(self.cfg.TRAINER.PROMPTKD.MTP_ALPHA),
-            "original_teacher_acc": 100.0 * float(original_correct) / float(total),
-            "mtp_raw_teacher_acc": 100.0 * float(mtp_raw_correct) / float(total),
-            "mtp_fused_teacher_acc": 100.0 * float(mtp_fused_correct) / float(total),
-            "cosine_mean_original_vs_mtp": float(cosine_all.mean().item()),
-            "cosine_min_original_vs_mtp": float(cosine_all.min().item()),
-            "cosine_max_original_vs_mtp": float(cosine_all.max().item()),
-            "mean_abs_logit_shift_mtp_raw": float(logit_shift_raw),
-            "mean_abs_logit_shift_mtp_fused": float(logit_shift_fused),
-        }
+        self._text_calibration_diag["split"] = split
+        self._text_calibration_diag["mean_abs_logit_shift"] = float(np.mean(logit_shift)) if logit_shift else 0.0
 
         diag_path = osp.join(
             self.output_dir,
             self.cfg.TRAINER.PROMPTKD.TEXT_CALIBRATION_DIAG_FILENAME,
         )
-
         with open(diag_path, "w") as f:
-            json.dump(diag, f, indent=2)
+            json.dump(self._text_calibration_diag, f, indent=2)
 
-        print(f"[PromptKD][TeacherTextDiag] Saved teacher text accuracy diagnosis to {diag_path}")
-        print(
-            "[PromptKD][TeacherTextDiag] "
-            f"original={diag['original_teacher_acc']:.2f}, "
-            f"mtp_raw={diag['mtp_raw_teacher_acc']:.2f}, "
-            f"mtp_fused={diag['mtp_fused_teacher_acc']:.2f}"
-        )
+        print(f"[PromptKD][Diag] Saved text calibration diagnostics to {diag_path}")
 
     def build_model(self):
         cfg = self.cfg
@@ -1177,16 +940,7 @@ class PromptKD(TrainerX):
         clip_model = load_clip_to_cpu(cfg)
         clip_model_teacher = load_clip_to_cpu_teacher(cfg)
 
-        mtp_use_prompt_tuned = bool(
-            getattr(cfg.TRAINER.PROMPTKD, "MTP_USE_PROMPT_TUNED", True)
-        )
-
-        need_zeroshot_text_model = (
-            (cfg.TRAINER.PROMPTKD.USE_MULTI_TEMPLATE_TEXT or cfg.TRAINER.PROMPTKD.TEXT_CALIBRATION_DIAGNOSE)
-        and not mtp_use_prompt_tuned
-        )
-
-        if need_zeroshot_text_model:
+        if cfg.TRAINER.PROMPTKD.USE_MULTI_TEMPLATE_TEXT or cfg.TRAINER.PROMPTKD.TEXT_CALIBRATION_DIAGNOSE:
             clip_model_teacher_zeroshot = load_clip_to_cpu_teacher(cfg, zero_shot_model=True)
             self.teacher_text_model = clip_model_teacher_zeroshot.to(self.device)
             self.teacher_text_model.eval()
